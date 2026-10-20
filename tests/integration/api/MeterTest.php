@@ -1,0 +1,215 @@
+<?php
+
+namespace ErnestDefoe\VelvetRope\Tests\integration\api;
+
+use PHPUnit\Framework\Attributes\Test;
+
+/**
+ * The meter: a guest's free discussions per period, then a lead-in.
+ * No rule here, so only the meter gates.
+ */
+class MeterTest extends GateTestCase
+{
+    protected function setUp(): void
+    {
+        parent::setUp();
+
+        $this->rules([]);
+    }
+
+    #[Test]
+    public function a_guest_reads_their_allowance_then_gets_a_lead_in()
+    {
+        $this->meter(2, ['meter_lead_in' => '20']);
+
+        $this->assertSame(2, substr_count($this->readAll(1), self::SECRET));
+        $this->assertSame(2, substr_count($this->readAll(2), self::SECRET));
+
+        $posts = $this->read(4);
+        $this->assertSame(['mode' => 'lead', 'reason' => 'meter'], $posts[1]['velvetRope']);
+        $this->assertStringContainsString('Opening words', $posts[1]['contentHtml']);
+        $this->assertLessThan(120, strlen($posts[1]['contentHtml']), 'only the lead-in');
+        $this->assertSame(['mode' => 'hide', 'reason' => 'meter'], $posts[2]['velvetRope']);
+        $this->assertStringNotContainsString(self::SECRET, json_encode($posts));
+
+        // Going back to a discussion already counted is free.
+        $this->assertSame(2, substr_count($this->readAll(1), self::SECRET));
+    }
+
+    #[Test]
+    public function the_discussion_reports_what_is_left()
+    {
+        $this->meter(2, ['meter_warn' => '1', 'meter_period' => 'week']);
+
+        $first = $this->json($this->show(1))['data']['attributes']['velvetRopeMeter'];
+        $this->assertSame(['limit' => 2, 'remaining' => 1, 'counted' => true, 'warn' => 1, 'period' => 'week'], $first);
+
+        $this->show(2);
+        $third = $this->json($this->show(4))['data']['attributes']['velvetRopeMeter'];
+        $this->assertSame(0, $third['remaining']);
+        $this->assertFalse($third['counted']);
+
+        // Lists carry nothing; members carry nothing.
+        $this->assertStringNotContainsString('velvetRopeMeter', (string) $this->get('/api/discussions')->getBody());
+        $this->assertStringNotContainsString('velvetRopeMeter', (string) $this->show(1, self::MEMBER)->getBody());
+    }
+
+    #[Test]
+    public function the_page_itself_counts_once_and_sets_the_cookie()
+    {
+        $this->meter(1);
+
+        $page = $this->get('/d/1');
+        $this->assertSame(200, $page->getStatusCode());
+        $this->assertStringContainsString(self::SECRET, (string) $page->getBody());
+        $this->assertNotSame([], array_filter(array_keys($this->jar), fn ($name) => str_ends_with($name, 'velvet_rope')));
+
+        // Its own data, loaded by the page script, is the same discussion: free.
+        $this->assertSame(2, substr_count($this->readAll(1), self::SECRET));
+
+        $other = (string) $this->get('/d/2')->getBody();
+        $this->assertStringNotContainsString(self::SECRET, $other);
+        $this->assertStringContainsString('VelvetRope-veil', $other);
+    }
+
+    #[Test]
+    public function a_forged_or_tampered_cookie_buys_nothing()
+    {
+        $this->meter(1);
+
+        $this->readAll(1);
+        $name = array_key_first(array_filter($this->jar, fn ($v, $k) => str_ends_with($k, 'velvet_rope'), ARRAY_FILTER_USE_BOTH));
+        [$start, $ids, $sig] = explode('.', $this->jar[$name]);
+
+        // Claim discussions 2 and 4 were read too, keeping the old signature,
+        // or signing with a guessed key: either way the cookie is thrown
+        // away, and a fresh allowance of 1 is all it buys.
+        foreach (["$start.$ids-2-4.$sig", "$start.2-4.".substr(hash_hmac('sha256', "$start.2-4", 'guess'), 0, 32)] as $forged) {
+            $this->jar[$name] = $forged;
+            $this->assertSame(2, substr_count($this->readAll(2), self::SECRET), 'the fresh allowance');
+            $this->assertStringNotContainsString(self::SECRET, $this->readAll(4), 'and no more');
+        }
+    }
+
+    #[Test]
+    public function an_expired_period_starts_a_new_allowance()
+    {
+        $this->meter(1, ['meter_period' => 'day']);
+
+        $old = (string) (time() - 90000);
+        $this->jar = ['flarum_velvet_rope' => "$old.1.".substr(hash_hmac('sha256', "$old.1", str_repeat('k', 64)), 0, 32)];
+        $this->jarFor = null;
+
+        $this->assertSame(2, substr_count($this->readAll(2), self::SECRET));
+    }
+
+    #[Test]
+    public function exempt_tags_are_never_counted()
+    {
+        $this->meter(1, ['meter_exempt_tags' => '[2]']);
+
+        $this->readAll(2);
+        $this->assertSame(2, substr_count($this->readAll(1), self::SECRET), 'Premium did not use the allowance');
+        $this->assertStringNotContainsString(self::SECRET, $this->readAll(4));
+        $this->assertSame(2, substr_count($this->readAll(2), self::SECRET), 'Premium is always free');
+    }
+
+    #[Test]
+    public function members_are_never_metered()
+    {
+        $this->meter(1);
+
+        foreach ([1, 2, 4] as $id) {
+            $this->assertSame(2, substr_count($this->readAll($id, self::MEMBER), self::SECRET));
+        }
+    }
+
+    #[Test]
+    public function the_meter_and_a_rule_together()
+    {
+        // Guests read every reply while their allowance lasts... no: the rule
+        // still holds replies back. The meter decides the first post.
+        $this->meter(1, ['meter_lead_in' => '10']);
+        $this->rules([['tags' => [], 'readers' => [3], 'freePosts' => 1]]);
+
+        $within = $this->read(1);
+        $this->assertArrayNotHasKey('velvetRope', $within[1]);
+        $this->assertSame('hide', $within[2]['velvetRope']['mode']);
+
+        $after = $this->read(2);
+        $this->assertSame(['mode' => 'lead', 'reason' => 'meter'], $after[1]['velvetRope']);
+    }
+
+    #[Test]
+    public function loading_posts_without_opening_the_discussion_still_counts()
+    {
+        $this->meter(1);
+
+        // A scraper asks for the posts straight away, by discussion or by id.
+        $byDiscussion = (string) $this->get('/api/posts', null, ['filter' => ['discussion' => 1]])->getBody();
+        $this->assertSame(2, substr_count($byDiscussion, self::SECRET), 'the allowance pays for it');
+
+        $byId = (string) $this->get('/api/posts', null, ['filter' => ['id' => '22,23']])->getBody();
+        $this->assertStringNotContainsString(self::SECRET, $byId, 'and is then spent');
+    }
+
+    #[Test]
+    public function search_and_lists_spend_nothing()
+    {
+        $this->meter(1);
+
+        $search = (string) $this->get('/api/discussions', null, ['filter' => ['q' => self::SECRET], 'include' => 'mostRelevantPost'])->getBody();
+        $this->assertStringNotContainsString('says '.self::SECRET, $search, 'an uncounted discussion: lead-in only');
+        $this->get('/api/posts', null, ['filter' => ['q' => self::SECRET]]);
+        $this->get('/api/posts/12');
+
+        $this->assertSame(2, substr_count($this->readAll(2), self::SECRET), 'the allowance is still there');
+    }
+
+    #[Test]
+    public function refusing_cookies_resets_the_allowance_unless_addresses_count_too()
+    {
+        $this->meter(1);
+
+        // No cookies kept: every request is a first visit.
+        foreach ([1, 2, 4] as $id) {
+            $this->jar = [];
+            $this->assertSame(2, substr_count($this->readAll($id), self::SECRET));
+        }
+    }
+
+    #[Test]
+    public function counting_by_address_catches_a_visitor_without_cookies()
+    {
+        $this->meter(1, ['meter_by_ip' => '1']);
+
+        $this->assertSame(2, substr_count($this->readAll(1), self::SECRET));
+
+        foreach ([2, 4] as $id) {
+            $this->jar = [];
+            $this->assertStringNotContainsString(self::SECRET, $this->readAll($id));
+        }
+
+        // The discussion already read stays free from that address.
+        $this->jar = [];
+        $this->assertSame(2, substr_count($this->readAll(1), self::SECRET));
+
+        // No address is stored, only a hash of it.
+        $this->assertStringNotContainsString('127.0.0.1', json_encode($this->database()->table('settings')->get()));
+    }
+
+    #[Test]
+    public function a_reply_rendered_for_no_visitor_assumes_the_allowance_is_spent()
+    {
+        // What flarum/realtime does: the API client, as a brand-new Guest.
+        $this->meter(5);
+        $client = $this->app()->getContainer()->make(\Flarum\Api\Client::class);
+
+        $body = (string) $client->withActor(new \Flarum\User\Guest())->get('/posts/12')->getBody();
+        $this->assertStringNotContainsString(self::SECRET, $body);
+        $this->assertStringContainsString('"generic":true', $body, 'so the page fetches it again for its reader');
+
+        // A real guest, with allowance, reads it.
+        $this->assertSame(2, substr_count($this->readAll(1), self::SECRET));
+    }
+}
